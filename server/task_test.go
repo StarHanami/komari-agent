@@ -18,6 +18,9 @@ var testTargets = []struct {
 }
 
 func TestICMPPing(t *testing.T) {
+	if testing.Short() {
+		t.Skip("external network integration test (DNS, IPv6 and/or raw sockets required)")
+	}
 	timeout := 3 * time.Second
 	for _, tt := range testTargets {
 		t.Run(tt.target, func(t *testing.T) {
@@ -33,6 +36,9 @@ func TestICMPPing(t *testing.T) {
 }
 
 func TestTCPPing(t *testing.T) {
+	if testing.Short() {
+		t.Skip("external network integration test (DNS, IPv6 and/or raw sockets required)")
+	}
 	timeout := 3 * time.Second
 	for _, tt := range testTargets {
 		t.Run(tt.target, func(t *testing.T) {
@@ -48,6 +54,9 @@ func TestTCPPing(t *testing.T) {
 }
 
 func TestHTTPPing(t *testing.T) {
+	if testing.Short() {
+		t.Skip("external network integration test (DNS, IPv6 and/or raw sockets required)")
+	}
 	timeout := 3 * time.Second
 	for _, tt := range testTargets {
 		t.Run(tt.target, func(t *testing.T) {

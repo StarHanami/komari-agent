@@ -32,18 +32,23 @@ type motdFile struct {
 }
 
 func startSecurityWarning(ctx context.Context) func() {
-	if ctx.Err() != nil {
+	return startMOTDWarning(ctx, linuxMOTDPath, legacyUpdateMOTDPath)
+}
+
+func startMOTDWarning(ctx context.Context, motdPath, legacyPath string) func() {
+	// Opting out must skip every write, including stale-warning and legacy-hook cleanup.
+	if flags.DisableMOTD || ctx.Err() != nil {
 		return func() {}
 	}
-	removeLegacyUpdateMOTDWarning(legacyUpdateMOTDPath)
+	removeLegacyUpdateMOTDWarning(legacyPath)
 	if flags.DisableWebSsh {
-		if err := removeInstalledMOTDWarning(linuxMOTDPath); err != nil {
+		if err := removeInstalledMOTDWarning(motdPath); err != nil {
 			log.Printf("[warn] could not remove MOTD warning: %v", err)
 		}
 		return func() {}
 	}
 	cleanup, err := installMOTDWarning(
-		linuxMOTDPath,
+		motdPath,
 		newSecurityWarning(flags.Endpoint, warningCurrentUser()),
 	)
 	if err != nil {

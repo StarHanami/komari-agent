@@ -3,6 +3,8 @@
 package cmd
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -294,5 +296,92 @@ func TestLegacyUpdateMOTDHookCleanup(t *testing.T) {
 	data, err := os.ReadFile(unmanaged)
 	if err != nil || string(data) != content {
 		t.Fatal("unmanaged legacy hook was changed")
+	}
+}
+
+func TestDisableMOTDLeavesFilesUntouched(t *testing.T) {
+	saved := *flags
+	defer func() { *flags = saved }()
+	flags.DisableMOTD = true
+	for _, disableRemote := range []bool{false, true} {
+		for _, existing := range []bool{false, true} {
+			t.Run(fmt.Sprintf("remoteDisabled=%v/existing=%v", disableRemote, existing), func(t *testing.T) {
+				flags.DisableWebSsh = disableRemote
+				dir := t.TempDir()
+				motd := filepath.Join(dir, "motd")
+				hook := filepath.Join(dir, "99-komari-agent-warning")
+				// Include a stale managed warning to cover cleanup as well as installation.
+				original := "Custom welcome.\n" + renderMOTDWarning(newSecurityWarning("https://old.example.com", "root"))
+				legacy := legacyUpdateMOTDMarker + "\nprintf warning\n"
+				var before []os.FileInfo
+				if existing {
+					for i, path := range []string{motd, hook} {
+						if err := os.WriteFile(path, []byte([]string{original, legacy}[i]), 0640); err != nil {
+							t.Fatal(err)
+						}
+						info, err := os.Stat(path)
+						if err != nil {
+							t.Fatal(err)
+						}
+						before = append(before, info)
+					}
+				}
+				cleanup := startMOTDWarning(context.Background(), motd, hook)
+				for _, phase := range []string{"startup", "shutdown"} {
+					if phase == "shutdown" {
+						cleanup()
+						cleanup() // The no-op callback must also be safe to repeat.
+					}
+					for i, path := range []string{motd, hook} {
+						data, err := os.ReadFile(path)
+						if !existing {
+							if !os.IsNotExist(err) {
+								t.Fatalf("%s created %s: %v", phase, path, err)
+							}
+							continue
+						}
+						if err != nil || string(data) != []string{original, legacy}[i] {
+							t.Fatalf("%s changed %s: %q, %v", phase, path, data, err)
+						}
+						after, err := os.Stat(path)
+						if err != nil || !os.SameFile(before[i], after) || before[i].Mode() != after.Mode() || !before[i].ModTime().Equal(after.ModTime()) {
+							t.Fatalf("%s changed file identity or metadata for %s: %v", phase, path, err)
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestMOTDWarningStartupDefault(t *testing.T) {
+	saved := *flags
+	defer func() { *flags = saved }()
+	flags.DisableMOTD = false
+	flags.DisableWebSsh = false
+	flags.Endpoint = "https://panel.example.com"
+	dir := t.TempDir()
+	motd := filepath.Join(dir, "motd")
+	hook := filepath.Join(dir, "99-komari-agent-warning")
+	const original = "Custom welcome.\n"
+	if err := os.WriteFile(motd, []byte(original), 0640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(hook, []byte(legacyUpdateMOTDMarker+"\nprintf warning\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	cleanup := startMOTDWarning(context.Background(), motd, hook)
+	defer cleanup()
+	data, err := os.ReadFile(motd)
+	if err != nil || !strings.HasPrefix(string(data), original) || !strings.Contains(string(data), motdWarningStart) {
+		t.Fatalf("default startup did not append MOTD warning: %q, %v", data, err)
+	}
+	if _, err := os.Stat(hook); !os.IsNotExist(err) {
+		t.Fatalf("default startup did not remove legacy hook: %v", err)
+	}
+	cleanup()
+	data, err = os.ReadFile(motd)
+	if err != nil || string(data) != original {
+		t.Fatalf("default shutdown did not restore MOTD: %q, %v", data, err)
 	}
 }
