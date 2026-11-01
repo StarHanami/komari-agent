@@ -90,6 +90,10 @@ func ReadProcMeminfo() (*ProcMemInfo, error) {
 }
 
 func GetMemHtopLike() RamInfo {
+	// /proc/meminfo and the htop formula are Linux-specific.
+	if runtime.GOOS != "linux" {
+		return GetMemGopsutil()
+	}
 	raminfo := RamInfo{Mode: "htoplike"}
 	if runtime.GOOS == "linux" {
 		info, err := ReadProcMeminfo()
@@ -134,7 +138,7 @@ func CallFree() RamInfo {
 	raminfo := RamInfo{Mode: "callFree"}
 
 	// Only works on Linux/Unix systems
-	if runtime.GOOS != "linux" && runtime.GOOS != "freebsd" {
+	if runtime.GOOS != "linux" {
 		return raminfo
 	}
 

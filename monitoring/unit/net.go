@@ -20,7 +20,7 @@ func ConnectionsCount() (tcpCount, udpCount int, err error) {
 		return connectionsCountWithProcFallback(procRoot(), gopsutilConnectionsCount)
 	}
 
-	return gopsutilConnectionsCount()
+	return platformConnectionsCount()
 }
 
 func connectionsCountWithProcFallback(root string, fallback func() (int, int, error)) (tcpCount, udpCount int, err error) {

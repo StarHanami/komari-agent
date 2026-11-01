@@ -35,8 +35,8 @@ log_config() {
     echo -e "${CYAN}[CONFIG]${NC} $1"
 }
 
-# $EUID 是 bash 专有变量, ash/dash 下未定义, 补 POSIX 回退
-EUID=${EUID:-$(id -u)}
+# Do not assign Bash's read-only EUID; id works with both Bash and /bin/sh.
+installer_uid=$(id -u)
 
 # Default values
 service_name="komari-agent"
@@ -55,7 +55,7 @@ case $os_type in
         os_name="darwin"
         target_dir="/usr/local/komari"  # Use /usr/local on macOS
         # Check if we can write to /usr/local, fallback to user directory
-        if [ ! -w "/usr/local" ] && [ "$EUID" -ne 0 ]; then
+        if [ ! -w "/usr/local" ] && [ "$installer_uid" -ne 0 ]; then
             target_dir="$HOME/.komari"
             log_info "No write permission to /usr/local, using user directory: $target_dir"
         fi
@@ -65,6 +65,8 @@ case $os_type in
         ;;
     FreeBSD)
         os_name="freebsd"
+        target_dir="/usr/local/libexec/komari-agent"
+        service_user="root"
         ;;
     MINGW*|MSYS*|CYGWIN*)
         os_name="windows"
@@ -78,6 +80,12 @@ esac
 
 # Parse install-specific arguments
 komari_args=""
+freebsd_args=""
+shell_quote() {
+    printf "'"
+    printf '%s' "$1" | sed "s/'/'\\\\''/g"
+    printf "'"
+}
 # [[ ]] -> [ ] (POSIX)
 while [ $# -gt 0 ]; do
     case $1 in
@@ -109,6 +117,7 @@ while [ $# -gt 0 ]; do
         *)
             # Non-install arguments go to komari_args
             komari_args="$komari_args $1"
+            freebsd_args="$freebsd_args $(shell_quote "$1")"
             shift
             ;;
     esac
@@ -117,8 +126,34 @@ done
 # Remove leading space from komari_args if present
 komari_args="${komari_args# }"
 
+# Fail before touching an existing installation when rc.d cannot be managed.
+if [ "$os_name" = "freebsd" ]; then
+    if [ "$installer_uid" -ne 0 ]; then
+        log_error "FreeBSD system service installation requires root (use su or sudo)."
+        exit 1
+    fi
+    case "$service_name" in
+        ''|[!a-zA-Z_]*|*[!a-zA-Z0-9_-]*)
+            log_error "Invalid FreeBSD service name: use letters, digits, underscores and hyphens, starting with a letter or underscore."
+            exit 1 ;;
+    esac
+    case "$target_dir" in
+        /*) ;;
+        *) log_error "FreeBSD installation directory must be absolute."; exit 1 ;;
+    esac
+    freebsd_rc_name=$(printf '%s' "$service_name" | tr '-' '_')
+    freebsd_rc_file="/usr/local/etc/rc.d/${freebsd_rc_name}"
+    freebsd_data_dir="/var/db/${freebsd_rc_name}"
+    for required in /usr/sbin/daemon /usr/sbin/service /usr/sbin/sysrc /etc/rc.subr; do
+        if [ ! -r "$required" ]; then
+            log_error "Required FreeBSD service component is missing: $required"
+            exit 1
+        fi
+    done
+fi
+
 # A direct, unprivileged installation belongs entirely to the invoking user.
-if [ "$EUID" -ne 0 ] && [ "$install_dir_specified" = false ]; then
+if [ "$installer_uid" -ne 0 ] && [ "$install_dir_specified" = false ]; then
     case "$os_name" in
         linux|freebsd)
             target_dir="${XDG_DATA_HOME:-$HOME/.local/share}/komari"
@@ -129,7 +164,7 @@ fi
 komari_agent_path="${target_dir}/agent"
 
 # User services are the only service type a non-root Linux installation can manage.
-if [ "$EUID" -ne 0 ] && [ "$os_name" = "linux" ]; then
+if [ "$installer_uid" -ne 0 ] && [ "$os_name" = "linux" ]; then
     if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
         user_service=true
     else
@@ -161,7 +196,14 @@ uninstall_previous() {
     log_step "Checking for previous installation..."
     
     # Stop and disable service if it exists
-    if [ "$user_service" = true ]; then
+    if [ "$os_name" = "freebsd" ]; then
+        if [ -f "$freebsd_rc_file" ]; then
+            log_info "Stopping existing FreeBSD service..."
+            if /usr/sbin/service "$freebsd_rc_name" onestatus >/dev/null 2>&1; then
+                /usr/sbin/service "$freebsd_rc_name" onestop || return 1
+            fi
+        fi
+    elif [ "$user_service" = true ]; then
         if systemctl --user list-unit-files | grep -q "${service_name}.service"; then
             log_info "Stopping and disabling existing systemd user service..."
             systemctl --user stop "${service_name}.service" || true
@@ -207,18 +249,17 @@ uninstall_previous() {
         fi
     fi
     
-    # Remove old binary if it exists
-    if [ -f "$komari_agent_path" ]; then
-        log_info "Removing old binary..."
-        rm -f "$komari_agent_path"
-    fi
+    # Keep the old binary until the validated download can replace it atomically.
 }
-
-# Uninstall previous installation
-uninstall_previous
 
 install_dependencies() {
     log_step "Checking and installing dependencies..."
+
+    # FreeBSD ships fetch with TLS support; a normal base system needs no packages.
+    if [ "$os_name" = "freebsd" ] && command -v fetch >/dev/null 2>&1; then
+        log_success "Using FreeBSD base fetch (no curl package required)"
+        return
+    fi
 
     local deps="curl"
     local missing_deps=""
@@ -229,13 +270,19 @@ install_dependencies() {
     done
 
     if [ -n "$missing_deps" ]; then
-        if [ "$EUID" -ne 0 ]; then
+        if [ "$installer_uid" -ne 0 ]; then
             log_error "Missing required dependencies:$missing_deps"
             log_info "Install them with your system package manager, then run this script again."
             exit 1
         fi
         # Check package manager and install dependencies
-        if command -v apt >/dev/null 2>&1; then
+        if [ "$os_name" = "freebsd" ]; then
+            log_info "Using pkg to install curl and CA certificates..."
+            if ! pkg -N >/dev/null 2>&1; then
+                env ASSUME_ALWAYS_YES=yes pkg bootstrap || exit 1
+            fi
+            pkg install -y curl ca_root_nss || exit 1
+        elif command -v apt >/dev/null 2>&1; then
             log_info "Using apt to install dependencies..."
             apt update
             apt install -y $missing_deps
@@ -253,7 +300,7 @@ install_dependencies() {
             log_info "Using Homebrew to install dependencies..."
             brew install $missing_deps
         else
-            log_error "No supported package manager found (apt/yum/apk/opkg/brew)"
+            log_error "No supported package manager found (pkg/apt/yum/apk/opkg/brew)"
             exit 1
         fi
         
@@ -279,7 +326,7 @@ install_dependencies
 # Architecture detection with platform-specific support
 arch=$(uname -m)
 case $arch in
-    x86_64)
+    x86_64|amd64)
         arch="amd64"
         ;;
     aarch64|arm64)
@@ -321,6 +368,24 @@ log_info "Detected OS: ${GREEN}$os_name${NC}, Architecture: ${GREEN}$arch${NC}"
 
 file_name="komari-agent-${os_name}-${arch}"
 
+fetch_release_json() {
+    if [ "$os_name" = "freebsd" ] && command -v fetch >/dev/null 2>&1; then
+        env HTTP_USER_AGENT=komari-agent-installer fetch -q -T 30 -o - "$1"
+    else
+        curl -fsSL --connect-timeout 15 \
+            -H "Accept: application/vnd.github+json" \
+            -H "User-Agent: komari-agent-installer" "$1"
+    fi
+}
+
+download_agent_binary() {
+    if [ "$os_name" = "freebsd" ] && command -v fetch >/dev/null 2>&1; then
+        fetch -q -T 60 -o "$2" "$1"
+    else
+        curl -fL --connect-timeout 15 -o "$2" "$1"
+    fi
+}
+
 resolve_snapshot_version() {
     snapshot_api_url="https://api.github.com/repos/StarHanami/komari-agent/releases?per_page=100"
     if [ -n "$github_proxy" ]; then
@@ -330,10 +395,7 @@ resolve_snapshot_version() {
     fi
 
     for api_url in $snapshot_api_urls; do
-        if ! releases_json=$(curl -fsSL --connect-timeout 15 \
-            -H "Accept: application/vnd.github+json" \
-            -H "User-Agent: komari-agent-installer" \
-            "$api_url"); then
+        if ! releases_json=$(fetch_release_json "$api_url"); then
             releases_json=""
         fi
 
@@ -390,8 +452,8 @@ else
 fi
 
 log_step "Creating installation directory: ${GREEN}$target_dir${NC}"
-mkdir -p "$target_dir"
-if [ "$EUID" -eq 0 ] && [ "$service_user" != "root" ]; then
+mkdir -p "$target_dir" || exit 1
+if [ "$installer_uid" -eq 0 ] && [ "$service_user" != "root" ]; then
     chown "$service_user" "$target_dir"
 fi
 
@@ -408,15 +470,18 @@ https://ghproxy.net/${download_url}
 "
 fi
 
+download_tmp=$(mktemp "${target_dir}/.agent-download.XXXXXX") || exit 1
+trap '[ -z "$download_tmp" ] || rm -f "$download_tmp"' 0
+trap 'exit 1' HUP INT TERM
 dl_ok=""
 for u in $download_urls; do
     log_step "Downloading $file_name ..."
     log_info "URL: ${CYAN}$u${NC}"
-    if curl -fL --connect-timeout 15 -o "$komari_agent_path" "$u" && [ -s "$komari_agent_path" ]; then
+    if download_agent_binary "$u" "$download_tmp" && [ -s "$download_tmp" ]; then
         dl_ok=1
         break
     fi
-    rm -f "$komari_agent_path"
+    : > "$download_tmp"
 done
 
 if [ -z "$dl_ok" ]; then
@@ -425,9 +490,18 @@ if [ -z "$dl_ok" ]; then
     exit 1
 fi
 
+# Validate the new binary before stopping or replacing the previous installation.
+chmod 755 "$download_tmp" || exit 1
+if [ "$os_name" = "freebsd" ] && ! "$download_tmp" --help >/dev/null; then
+    log_error "Downloaded agent cannot run on this FreeBSD host; existing installation preserved."
+    exit 1
+fi
+uninstall_previous || exit 1
+mv -f "$download_tmp" "$komari_agent_path" || exit 1
+download_tmp=""
 # Set executable permissions
 chmod +x "$komari_agent_path"
-if [ "$EUID" -eq 0 ] && [ "$service_user" != "root" ]; then
+if [ "$installer_uid" -eq 0 ] && [ "$service_user" != "root" ]; then
     chown "$service_user" "$komari_agent_path"
 fi
 log_success "Komari-agent installed to ${GREEN}$komari_agent_path${NC}"
@@ -437,6 +511,10 @@ log_step "Configuring system service..."
 
 # Function to detect actual init system
 detect_init_system() {
+    if [ "$os_name" = "freebsd" ]; then
+        echo "freebsd-rc"
+        return
+    fi
     # Check if running on NixOS (special case)
     if [ -f /etc/NIXOS ]; then
         echo "nixos"
@@ -531,7 +609,38 @@ fi
 log_info "Detected init system: ${GREEN}$init_system${NC}"
 
 # Handle each init system
-if [ "$init_system" = "nixos" ]; then
+if [ "$init_system" = "freebsd-rc" ]; then
+    # rc.d manages the daemon supervisor PID, not the child (which may self-update).
+    # Keep traffic history separate from replaceable binaries and root-only arguments.
+    mkdir -p /usr/local/etc/rc.d "$freebsd_data_dir" || exit 1
+    chmod 700 "$freebsd_data_dir" || exit 1
+    freebsd_launcher="${target_dir}/run-agent"
+    (
+        umask 077
+        {
+            printf '#!/bin/sh\n# Komari Agent managed launcher\n'
+            printf 'cd %s || exit 1\n' "$(shell_quote "$freebsd_data_dir")"
+            printf 'exec %s%s\n' "$(shell_quote "$komari_agent_path")" "$freebsd_args"
+        } > "$freebsd_launcher"
+    ) || exit 1
+    chmod 700 "$freebsd_launcher" || exit 1
+    {
+        printf '#!/bin/sh\n# PROVIDE: %s\n# REQUIRE: NETWORKING LOGIN\n# KEYWORD: shutdown\n\n' "$freebsd_rc_name"
+        printf '. /etc/rc.subr\nname=%s\n' "$(shell_quote "$freebsd_rc_name")"
+        printf 'rcvar="${name}_enable"\nload_rc_config "$name"\n'
+        printf ': ${%s_enable:=NO}\n' "$freebsd_rc_name"
+        printf 'command="/usr/sbin/daemon"\nprocname="/usr/sbin/daemon"\n'
+        printf 'pidfile="/var/run/${name}.pid"\n'
+        printf 'command_args=%s\n' "$(shell_quote "-f -S -T ${freebsd_rc_name} -R 5 -P /var/run/${freebsd_rc_name}.pid -p /var/run/${freebsd_rc_name}.child.pid /bin/sh $(shell_quote "$freebsd_launcher")")"
+        printf 'run_rc_command "$1"\n'
+    } > "$freebsd_rc_file" || exit 1
+    chmod 755 "$freebsd_rc_file" || exit 1
+    /usr/sbin/sysrc "${freebsd_rc_name}_enable=YES" || exit 1
+    /usr/sbin/service "$freebsd_rc_name" start || exit 1
+    /usr/sbin/service "$freebsd_rc_name" status || exit 1
+    log_success "FreeBSD rc.d service configured and started: $freebsd_rc_name"
+    log_info "Traffic history: $freebsd_data_dir/net_static.json; logs: /var/log/messages (tag $freebsd_rc_name)"
+elif [ "$init_system" = "nixos" ]; then
     log_warning "NixOS detected. System services must be configured declaratively."
     log_info "Please add the following to your NixOS configuration:"
     echo ""
@@ -677,7 +786,7 @@ elif [ "$init_system" = "launchd" ]; then
     case "$target_dir" in
         /Users/*) is_user_install=true ;;
     esac
-    [ "$EUID" -ne 0 ] && is_user_install=true
+    [ "$installer_uid" -ne 0 ] && is_user_install=true
     
     if [ "$is_user_install" = true ]; then
         # User-level service (LaunchAgent)
@@ -784,7 +893,7 @@ EOF
     log_success "Upstart service configured and started"
 else
     log_error "Unsupported or unknown init system detected: $init_system"
-    log_error "Supported init systems: systemd, openrc, procd, launchd"
+    log_error "Supported init systems: freebsd-rc, systemd, openrc, procd, launchd, upstart"
     exit 1
 fi
 

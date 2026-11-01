@@ -3,6 +3,10 @@
 StarHanami fork of [komari-monitor/komari-agent](https://github.com/komari-monitor/komari-agent).
 本分支的安装脚本和二进制自动更新均使用 `StarHanami/komari-agent` 的 Releases，容器镜像使用 `ghcr.io/starhanami/komari-agent`。
 
+## FreeBSD 安装
+
+FreeBSD 15.1 的原生安装、Snapshot、服务管理和数据目录说明见 [FreeBSD 文档](docs/FREEBSD.md)。
+
 ## 配置方式
 
 agent 参数可以通过命令行参数、环境变量或 JSON 配置文件传入。
